@@ -313,6 +313,185 @@ def main() -> int:
         check("端点可行却无安全路线 422", r.status_code == 422
               and r.json()["detail"]["error"] == "no_safe_route", r.text)
 
+        # ---------------------------------------------------------------- #
+        # 频点占用：登记 / 查询 / 撤销，及其对规划与逐组切换的影响
+        # ---------------------------------------------------------------- #
+        r = c.post("/sessions", json={"name": "占用演示",
+                                      "frequencies": [1, 4]})
+        zid = r.json()["id"]
+        check("创建占用演示场次", r.status_code == 201, r.text)
+        r = c.post(f"/sessions/{zid}/groups",
+                   json={"name": "ha", "start": 0, "end": 120})
+        ha = r.json()["id"]
+        r = c.post(f"/sessions/{zid}/groups",
+                   json={"name": "hb", "start": 60, "end": 180})
+        hb = r.json()["id"]
+        c.post(f"/sessions/{zid}/interferences",
+               json={"group_a": ha, "group_b": hb, "min_separation": 3})
+        r = c.post(f"/sessions/{zid}/plans",
+                   json={"base_version": 0, "locks": []})
+        check("占用演示 v1 发布", r.status_code == 201, r.text)
+        a = {x["group_id"]: x["frequency"] for x in r.json()["assignments"]}
+        check("v1 字典序最小", (a[ha], a[hb]) == (1, 4), str(a))
+
+        # 登记校验失败：整次拒绝
+        r = c.post(f"/sessions/{zid}/occupancies",
+                   json={"frequency": 4, "start": 10, "end": 10})
+        check("占用起点不早于终点被拒绝(400)", r.status_code == 400, r.text)
+        r = c.post(f"/sessions/{zid}/occupancies",
+                   json={"frequency": 99, "start": 0, "end": 60})
+        check("占用频点不属于场次被拒绝(400)", r.status_code == 400, r.text)
+        r = c.post("/sessions/999999/occupancies",
+                   json={"frequency": 1, "start": 0, "end": 60})
+        check("未知场次登记占用(404)", r.status_code == 404, r.text)
+
+        # 正常登记 o1：频点 4 在 [0,60) 被占用 —— 与 ha[0,120) 相交，
+        # 与 hb[60,180) 端点相接（不算相交）
+        r = c.post(f"/sessions/{zid}/occupancies",
+                   json={"frequency": 4, "start": 0, "end": 60})
+        check("登记占用记录(201)", r.status_code == 201, r.text)
+        o1 = r.json()["id"]
+        r = c.get(f"/sessions/{zid}/occupancies")
+        check("查询当前占用", [o["id"] for o in r.json()] == [o1], r.text)
+        r = c.get(f"/sessions/{zid}")
+        check("场次详情包含占用记录",
+              [o["id"] for o in r.json()["occupancies"]] == [o1], r.text)
+
+        # 端点相接不算相交：hb 仍可用频点 4，v2 保持 (1,4)、改频 0
+        r = c.post(f"/sessions/{zid}/plans",
+                   json={"base_version": 1, "locks": []})
+        check("占用下发布 v2", r.status_code == 201, r.text)
+        body = r.json()
+        a = {x["group_id"]: x["frequency"] for x in body["assignments"]}
+        check("端点相接的组不受占用影响",
+              (a[ha], a[hb]) == (1, 4) and body["changes"] == 0, str(a))
+
+        # 再登记 o2：频点 1 在 [30,90) 被占用（与 ha、hb 均相交）→ 无解
+        r = c.post(f"/sessions/{zid}/occupancies",
+                   json={"frequency": 1, "start": 30, "end": 90})
+        o2 = r.json()["id"]
+        r = c.post(f"/sessions/{zid}/plans",
+                   json={"base_version": 2, "locks": []})
+        check("占用导致无解(422)", r.status_code == 422, r.text)
+        detail = r.json()["detail"]
+        check("无解指出相关占用",
+              detail["cause"] == "occupancies"
+              and {o["id"] for o in detail["occupancies"]} == {o2},
+              str(detail))
+        r = c.get(f"/sessions/{zid}/plans")
+        check("占用无解后发布版不变",
+              [p["version"] for p in r.json()] == [1, 2], r.text)
+
+        # 撤销 o2 后恢复可解；撤销未知记录 404
+        r = c.delete(f"/sessions/{zid}/occupancies/{o2}")
+        check("撤销占用记录", r.status_code == 200
+              and r.json()["id"] == o2, r.text)
+        r = c.delete(f"/sessions/{zid}/occupancies/{o2}")
+        check("重复撤销未知记录(404)", r.status_code == 404, r.text)
+        r = c.delete(f"/sessions/{zid}/occupancies/999999")
+        check("撤销未知记录(404)", r.status_code == 404, r.text)
+        r = c.post(f"/sessions/{zid}/plans",
+                   json={"base_version": 2, "locks": []})
+        check("撤销后发布 v3", r.status_code == 201, r.text)
+
+        # 已发布版不可变：v1 仍为 (1,4)
+        r = c.get(f"/sessions/{zid}/plans/1")
+        a = {x["group_id"]: x["frequency"] for x in r.json()["assignments"]}
+        check("已发布版不因占用变化重写", (a[ha], a[hb]) == (1, 4), str(a))
+
+        # 占用变更按场次串行：并发登记全部成功且互不丢失
+        occ_results = []
+
+        def register_occ():
+            rr = httpx.post(f"{BASE}/sessions/{zid}/occupancies",
+                            json={"frequency": 4, "start": 200, "end": 300},
+                            timeout=30)
+            occ_results.append(rr.status_code)
+
+        threads = [threading.Thread(target=register_occ) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        check("并发登记占用全部成功", occ_results == [201] * 6,
+              str(occ_results))
+        r = c.get(f"/sessions/{zid}/occupancies")
+        check("并发登记无丢失", len(r.json()) == 7, r.text)
+
+        # ---- 占用对逐组切换的影响（独立场次，v1=(1,4,1)、v2=(4,1,4)） ----
+        r = c.post("/sessions", json={"name": "占用切换演示",
+                                      "frequencies": [1, 2, 3, 4, 5, 6, 7]})
+        xid = r.json()["id"]
+        xg = []
+        for name, s, e in [("xa", 0, 120), ("xb", 60, 180), ("xc", 120, 240)]:
+            r = c.post(f"/sessions/{xid}/groups",
+                       json={"name": name, "start": s, "end": e})
+            xg.append(r.json()["id"])
+        xa, xb, xc = xg
+        c.post(f"/sessions/{xid}/interferences",
+               json={"group_a": xa, "group_b": xb, "min_separation": 3})
+        c.post(f"/sessions/{xid}/interferences",
+               json={"group_a": xb, "group_b": xc, "min_separation": 3})
+        c.post(f"/sessions/{xid}/plans",
+               json={"base_version": 0,
+                     "locks": [{"group_id": xa, "frequency": 1},
+                               {"group_id": xb, "frequency": 4},
+                               {"group_id": xc, "frequency": 1}]})
+        c.post(f"/sessions/{xid}/plans",
+               json={"base_version": 1,
+                     "locks": [{"group_id": xa, "frequency": 4},
+                               {"group_id": xb, "frequency": 1},
+                               {"group_id": xc, "frequency": 4}]})
+        r = c.post(f"/sessions/{xid}/retune",
+                   json={"start_version": 1, "target_version": 2,
+                         "fixed_groups": []})
+        check("占用前切换路线 200", r.status_code == 200
+              and r.json()["steps_count"] == 4, r.text)
+
+        # 频点 4 在 [120,240) 被占用：与 xb[60,180)、xc[120,240) 相交，
+        # 与 xa[0,120) 端点相接；v1 的 xb=4、v2 的 xc=4 因此不可行
+        r = c.post(f"/sessions/{xid}/occupancies",
+                   json={"frequency": 4, "start": 120, "end": 240})
+        check("切换场次登记占用", r.status_code == 201, r.text)
+        o3 = r.json()["id"]
+        r = c.post(f"/sessions/{xid}/retune",
+                   json={"start_version": 1, "target_version": 2,
+                         "fixed_groups": []})
+        check("旧版因新占用不可行(422)", r.status_code == 422, r.text)
+        detail = r.json()["detail"]
+        check("沿用 endpoint_infeasible 语义",
+              detail["error"] == "endpoint_infeasible", str(detail))
+        check("起终点指出相关占用",
+              [o["occupancy_id"] for o in detail["start"]["occupancies"]]
+              == [o3]
+              and [o["occupancy_id"] for o in detail["target"]["occupancies"]]
+              == [o3], str(detail))
+        check("端点相接的组不算冲突",
+              all(o["group_id"] != xa
+                  for o in detail["target"]["occupancies"]), str(detail))
+
+        # 撤销后路线恢复
+        c.delete(f"/sessions/{xid}/occupancies/{o3}")
+        r = c.post(f"/sessions/{xid}/retune",
+                   json={"start_version": 1, "target_version": 2,
+                         "fixed_groups": []})
+        check("撤销后切换路线恢复", r.status_code == 200
+              and r.json()["steps_count"] == 4, r.text)
+
+        # 唯一缓冲频点 7 全程被占用：端点仍可行，但无安全路线
+        r = c.post(f"/sessions/{xid}/occupancies",
+                   json={"frequency": 7, "start": 0, "end": 240})
+        o4 = r.json()["id"]
+        r = c.post(f"/sessions/{xid}/retune",
+                   json={"start_version": 1, "target_version": 2,
+                         "fixed_groups": []})
+        check("占用缓冲频点导致无安全路线(422)", r.status_code == 422
+              and r.json()["detail"]["error"] == "no_safe_route", r.text)
+        c.delete(f"/sessions/{xid}/occupancies/{o4}")
+        r = c.get(f"/sessions/{xid}/plans")
+        check("切换查询不改动发布版",
+              [p["version"] for p in r.json()] == [1, 2], r.text)
+
         print()
         if _failures:
             print(f"{len(_failures)} 项失败: {_failures}")

@@ -6,7 +6,7 @@
 import pytest
 
 from app.retune import (NO_SAFE_ROUTE, RetuneLimitExceeded, RetunePlanner,
-                        violations)
+                        occupancy_conflicts, violations)
 
 
 def assert_route_valid(route, start, target, edges):
@@ -164,6 +164,43 @@ class TestFixedGroups:
             [1, 2], list(range(1, 8)), [(1, 2, 3)],
             {1: 1, 2: 4}, {1: 4, 2: 4}, fixed=[2])
         assert planner.plan() == NO_SAFE_ROUTE
+
+
+class TestForbidden:
+    """占用禁用频点：每一步（含临时步骤）都不得使用被占用频点。"""
+
+    def test_forbidden_frequency_changes_route(self):
+        # 缓冲频点 7 对组 1 禁用：路线改由组 2 借用 7，仍最短且字典序最小
+        edges = [(1, 2, 3)]
+        start, target = {1: 1, 2: 4}, {1: 4, 2: 1}
+        planner = RetunePlanner([1, 2], list(range(1, 8)), edges,
+                                start, target, forbidden={1: {7}})
+        route = planner.plan()
+        assert_route_valid(route, start, target, edges)
+        assert route == [(2, 7), (1, 4), (2, 1)]
+
+    def test_forbidden_frequency_freezes(self):
+        # 唯一缓冲频点对两组均被禁用：交换无安全路线
+        planner = RetunePlanner(
+            [1, 2], list(range(1, 8)), [(1, 2, 3)],
+            {1: 1, 2: 4}, {1: 4, 2: 1},
+            forbidden={1: {7}, 2: {5, 6, 7}})
+        assert planner.plan() == NO_SAFE_ROUTE
+
+
+class TestOccupancyConflicts:
+    def test_overlap_conflict_reported(self):
+        occs = [{"id": 7, "frequency": 4, "start": 60, "end": 120}]
+        intervals = {1: (0, 120), 2: (120, 240)}
+        # 组 1 [0,120) 与占用 [60,120) 相交 → 冲突；组 2 端点相接不相交
+        conflicts = occupancy_conflicts(intervals, {1: 4, 2: 4}, occs)
+        assert conflicts == [{"occupancy_id": 7, "group_id": 1,
+                              "frequency": 4, "start": 60, "end": 120}]
+
+    def test_no_conflict_when_frequency_differs(self):
+        occs = [{"id": 7, "frequency": 4, "start": 0, "end": 240}]
+        conflicts = occupancy_conflicts({1: (0, 120)}, {1: 5}, occs)
+        assert conflicts == []
 
 
 class TestFrozenConfigurations:

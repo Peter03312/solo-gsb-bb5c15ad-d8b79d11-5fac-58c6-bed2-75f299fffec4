@@ -6,7 +6,8 @@
 1. 每一步只把一个组改到本场次的可用频点（可借用临时频点），不可调频组
    全程不动；
 2. 每一步之后（含起点与终点）的完整分配都满足当前按时段相交生效的干扰
-   关系及最小频点间距；
+   关系及最小频点间距，且不使用被占用频点（组时段与占用时段相交时该
+   频点对本组禁用，端点相接不算相交）；
 3. 先最小化步骤数，再按各步的 (组编号, 新频点) 序列取字典序最小。
 
 若两端点本身可行、但配置空间中不存在这样的序列（冻结组件），返回
@@ -21,11 +22,39 @@ from __future__ import annotations
 
 from collections import deque
 
+from .solver import intervals_overlap
+
 NO_SAFE_ROUTE = "no_safe_route"
 
 
 class RetuneLimitExceeded(Exception):
     """搜索状态数超过资源上限。"""
+
+
+def occupancy_conflicts(group_intervals, assignment, occupancies):
+    """分配与占用记录的冲突明细。
+
+    组被分到某频点，且组时段与占用该频点的记录时段相交（左闭右开，
+    端点相接不算）时，构成一处冲突。
+
+    :param group_intervals: {group_id: (start, end)}。
+    :param assignment:      {group_id: frequency}。
+    :param occupancies:     占用记录 [{id, frequency, start, end}]。
+    """
+    conflicts = []
+    for rec in occupancies:
+        for gid in sorted(assignment):
+            if assignment[gid] != rec["frequency"]:
+                continue
+            gs, ge = group_intervals[gid]
+            if intervals_overlap(gs, ge, rec["start"], rec["end"]):
+                conflicts.append({
+                    "occupancy_id": rec["id"],
+                    "group_id": gid,
+                    "frequency": rec["frequency"],
+                    "start": rec["start"],
+                    "end": rec["end"]})
+    return conflicts
 
 
 def violations(groups, assignment, edges, frequencies):
@@ -56,15 +85,19 @@ class RetunePlanner:
     :param start:       起始版分配 {group_id: frequency}。
     :param target:      目标版分配 {group_id: frequency}。
     :param fixed:       切换期间不可调频的组集合。
+    :param forbidden:   各组被禁用的频点集合 {group_id: {frequency, ...}}，
+                        通常由当前频点占用按“时段相交”计算得到。
     """
 
     def __init__(self, group_ids, frequencies, edges, start, target,
-                 fixed=(), max_states: int = 200_000):
+                 fixed=(), forbidden=None, max_states: int = 200_000):
         self.groups = sorted(set(group_ids))
         self.frequencies = sorted(set(frequencies))
         self.start = dict(start)
         self.target = dict(target)
         self.fixed = set(fixed)
+        self.forbidden = {g: set((forbidden or {}).get(g, ()))
+                          for g in self.groups}
         self.edges = [(a, b, s) for a, b, s in edges]
         self.adj = {g: [] for g in self.groups}
         for g1, g2, sep in self.edges:
@@ -113,7 +146,9 @@ class RetunePlanner:
                             continue
                         bpos = lidx[b]
                         vals = [f for f in self.frequencies
-                                if f != state[bpos] and all(
+                                if f != state[bpos]
+                                and f not in self.forbidden[b]
+                                and all(
                                     abs(state[lidx[o]] - f) >= sep2
                                     for o, sep2 in self.adj[b])]
                         if vals:
@@ -127,8 +162,9 @@ class RetunePlanner:
                     bpos = lidx[b]
                     state = state[:bpos] + (f,) + state[bpos + 1:]
                     path.append((b, f))
-                elif all(abs(state[lidx[o]] - tgt) >= sep
-                         for o, sep in self.adj[g]):
+                elif tgt not in self.forbidden[g] and all(
+                        abs(state[lidx[o]] - tgt) >= sep
+                        for o, sep in self.adj[g]):
                     state = state[:pos] + (tgt,) + state[pos + 1:]
                     path.append((g, tgt))
                 else:
@@ -196,10 +232,11 @@ class RetunePlanner:
                     continue
                 pos = lidx[g]
                 cur = state[pos]
+                banned = self.forbidden[g]
                 base = state[:pos]
                 tail = state[pos + 1:]
                 for value in freqs:  # 频点升序；跳过当前频点（空操作不优）
-                    if value == cur:
+                    if value == cur or value in banned:
                         continue
                     for o, sep in self.adj[g]:
                         if abs(state[lidx[o]] - value) < sep:

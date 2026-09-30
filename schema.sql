@@ -27,6 +27,17 @@ CREATE TABLE IF NOT EXISTS interferences (
     CHECK (min_separation > 0)
 );
 
+-- 频点占用：现场其他设备在指定时段 [start_min, end_min) 占用场次频点
+CREATE TABLE IF NOT EXISTS occupancies (
+    id           SERIAL PRIMARY KEY,
+    session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    frequency    INTEGER NOT NULL,            -- 被占用的频点（须属于场次可用集合）
+    start_min    INTEGER NOT NULL,            -- 占用时段起点（分钟，左闭）
+    end_min      INTEGER NOT NULL,            -- 占用时段终点（分钟，右开）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (start_min < end_min)
+);
+
 -- 发布版：每个场次内版本号从 1 单调递增，发布后不可变
 CREATE TABLE IF NOT EXISTS plans (
     id           SERIAL PRIMARY KEY,

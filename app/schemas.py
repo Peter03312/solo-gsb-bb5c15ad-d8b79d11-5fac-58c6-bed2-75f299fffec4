@@ -23,6 +23,12 @@ class InterferenceCreate(BaseModel):
     min_separation: int = Field(description="正整数最小频点间距")
 
 
+class OccupancyCreate(BaseModel):
+    frequency: int = Field(description="被占用的频点（须属于场次可用集合）")
+    start: int = Field(description="占用时段起点（分钟，左闭）")
+    end: int = Field(description="占用时段终点（分钟，右开）")
+
+
 class Lock(BaseModel):
     group_id: int
     frequency: int

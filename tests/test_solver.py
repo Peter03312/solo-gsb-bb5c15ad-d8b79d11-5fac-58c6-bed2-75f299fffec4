@@ -1,6 +1,7 @@
 """求解器单元测试：可脱离数据库直接运行（python -m pytest tests/）。"""
 
-from app.solver import (FrequencySolver, analyze_unsat, intervals_overlap)
+from app.solver import (FrequencySolver, analyze_unsat, forbidden_frequencies,
+                        intervals_overlap)
 
 
 class TestIntervalsOverlap:
@@ -71,6 +72,33 @@ class TestSolve:
         assert changes == 0
 
 
+class TestForbidden:
+    """频点占用禁用：组时段与占用时段相交时不得选用该频点。"""
+
+    def test_forbidden_restricts_domain(self):
+        # 组 1 被禁用频点 1：字典序最小解改用 (2, 5)
+        solver = FrequencySolver([1, 2], [1, 2, 3, 4, 5], [(1, 2, 3)],
+                                 forbidden={1: {1}})
+        assignment, _ = solver.solve()
+        assert assignment == {1: 2, 2: 5}
+
+    def test_forbidden_unsatisfiable(self):
+        solver = FrequencySolver([1], [1, 2], [], forbidden={1: {1, 2}})
+        assert solver.solve() is None
+
+    def test_lock_on_forbidden_frequency_unsatisfiable(self):
+        # 锁定被占用禁用的频点：按无解处理（API 层以 422 报告相关占用）
+        solver = FrequencySolver([1], [1, 2], [], forbidden={1: {1}})
+        assert solver.solve({1: 1}) is None
+
+    def test_forbidden_frequencies_touching_not_overlap(self):
+        # 端点相接不算相交：组 1 [0,120) 不受 [120,200) 占用影响
+        forbidden = forbidden_frequencies(
+            {1: (0, 120), 2: (120, 240)},
+            [{"frequency": 5, "start": 120, "end": 200}])
+        assert forbidden == {1: set(), 2: {5}}
+
+
 class TestAnalyzeUnsat:
     def test_interference_core(self):
         # 三组两两间距 2、频点 {1,2,3}：任意两条关系可行，三条齐备则不可行
@@ -104,3 +132,53 @@ class TestAnalyzeUnsat:
         result = analyze_unsat([1, 2, 3], [1, 2, 3, 4, 5], edges, locks)
         assert result["cause"] == "locks"
         assert {l["group_id"] for l in result["locks"]} == {1, 2}
+
+
+class TestAnalyzeUnsatOccupancies:
+    """占用导致无解的分析：指出相关占用记录。"""
+
+    def test_occupancy_core(self):
+        # 两条占用分别禁用频点 1、2，去掉任一都可解
+        occs = [{"id": 1, "frequency": 1, "start": 0, "end": 120},
+                {"id": 2, "frequency": 2, "start": 0, "end": 120}]
+        result = analyze_unsat([1], [1, 2], [], {}, None, occs,
+                               {1: (0, 120)})
+        assert result["cause"] == "occupancies"
+        assert {o["id"] for o in result["occupancies"]} == {1, 2}
+        assert result["locks"] == []
+
+    def test_occupancy_core_excludes_non_overlapping(self):
+        # 记录 2 的时段 [120,240) 与组时段 [0,120) 端点相接不相交，
+        # 不应出现在核心中
+        occs = [{"id": 1, "frequency": 1, "start": 0, "end": 120},
+                {"id": 2, "frequency": 2, "start": 120, "end": 240},
+                {"id": 3, "frequency": 2, "start": 0, "end": 120}]
+        result = analyze_unsat([1], [1, 2], [], {}, None, occs,
+                               {1: (0, 120)})
+        assert result["cause"] == "occupancies"
+        assert {o["id"] for o in result["occupancies"]} == {1, 3}
+
+    def test_occupancies_not_implicated_when_locks_unsat(self):
+        # 锁定本身已导致无解（去掉占用仍无解）：归因为锁定
+        edges = [(1, 2, 3)]
+        locks = {1: 1, 2: 2}
+        occs = [{"id": 9, "frequency": 1, "start": 0, "end": 120}]
+        result = analyze_unsat([1, 2], [1, 2, 3, 4, 5], edges, locks,
+                               None, occs, {1: (0, 120), 2: (0, 120)})
+        assert result["cause"] == "locks"
+        assert result["occupancies"] == []
+
+    def test_mixed_lock_occupancy_core(self):
+        # 单独锁定或单独占用均可解，合并则无解：归因为占用并附上相关锁定
+        edges = [(1, 2, 3)]
+        locks = {1: 1}
+        # 组 1 [120,240) 与占用不相交；组 2 [0,120) 被禁用频点 4、5
+        occs = [{"id": 1, "frequency": 4, "start": 0, "end": 120},
+                {"id": 2, "frequency": 5, "start": 0, "end": 120}]
+        result = analyze_unsat([1, 2], [1, 2, 3, 4, 5], edges, locks,
+                               None, occs, {1: (120, 240), 2: (0, 120)})
+        assert result["cause"] == "occupancies"
+        assert {o["id"] for o in result["occupancies"]} == {1, 2}
+        assert result["locks"] == [{"group_id": 1, "frequency": 1}]
+        assert result["interferences"] == [
+            {"group_a": 1, "group_b": 2, "min_separation": 3}]

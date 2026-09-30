@@ -1,18 +1,20 @@
 # 频点协调服务
 
 为临时演出的无线电设备组协调频点。录入场次可用的整数频点、设备组使用时段
-（左闭右开）与组间干扰关系（正整数最小频点间距），服务在满足全部约束的前提
-下规划频点分配，并发布为不可变的版本。
+（左闭右开）、组间干扰关系（正整数最小频点间距）与现场其他设备的频点占用，
+服务在满足全部约束的前提下规划频点分配，并发布为不可变的版本。
 
 - 时段相交的干扰组，频点间距不小于其最小间距；同组全程只用一个频点；
+- 现场其他设备可按时段占用场次频点：设备组时段与占用时段相交（端点相接
+  不算）时不得选用该频点；已发布版不因占用变化自动重写；
 - 规划时可锁定部分组的频点；
 - 目标依次为：满足所有约束 → 最小化与前一发布版共有组的改频数（首次规划
   计零）→ 并列时按组编号升序的频点序列取字典序最小；
-- 无解时返回 422 并说明涉及的锁定组或干扰关系，当前发布版不变；
+- 无解时返回 422 并说明涉及的锁定组、干扰关系或占用记录，当前发布版不变；
 - 发布须提交所见版本号 `base_version`，过期即返回 409；并发发布只有一个
   可成功；各发布版不可变，可读取分配结果及与前版差异；
-- 起点不早于终点、引用未知组、锁定不可用频点等校验失败均返回 400 并拒绝
-  整次操作。
+- 起点不早于终点、引用未知组、锁定不可用频点、占用频点不属于场次等校验
+  失败均返回 400 并拒绝整次操作。
 
 ## 一键启动（Docker Compose）
 
@@ -62,6 +64,9 @@ python tests/integration_check.py
   即组编号（自增），规划的字典序比较按组编号升序；
 - **干扰关系（interference）**：两个组 + 正整数最小频点间距，仅当两组时段
   相交时生效；
+- **占用记录（occupancy）**：现场其他设备占用的频点 + 占用时段
+  `[start, end)`；组时段与占用时段相交（端点相接不算）时该组不得选用
+  该频点；仅影响其后的规划与切换计算，不回写已发布版；
 - **发布版（plan）**：场次内版本号从 1 递增，发布后不可变，记录分配结果、
   改频数与本次锁定。
 
@@ -70,9 +75,12 @@ python tests/integration_check.py
 | 方法 | 路径 | 说明 |
 | ---- | ---- | ---- |
 | POST | `/sessions` | 创建场次（登记可用频点集合） |
-| GET  | `/sessions/{id}` | 场次详情（含组与干扰关系） |
+| GET  | `/sessions/{id}` | 场次详情（含组、干扰关系与当前占用） |
 | POST | `/sessions/{id}/groups` | 录入设备组及时段 |
 | POST | `/sessions/{id}/interferences` | 录入干扰关系 |
+| POST | `/sessions/{id}/occupancies` | 登记频点占用记录（频点 + 时段） |
+| GET  | `/sessions/{id}/occupancies` | 查询当前占用记录 |
+| DELETE | `/sessions/{id}/occupancies/{oid}` | 撤销占用记录 |
 | POST | `/sessions/{id}/plans` | 规划并发布新版本（携带 `base_version` 与 `locks`） |
 | GET  | `/sessions/{id}/plans` | 列出全部发布版 |
 | GET  | `/sessions/{id}/plans/{version}` | 读取指定发布版分配结果 |
@@ -80,8 +88,9 @@ python tests/integration_check.py
 | POST | `/sessions/{id}/retune` | 计算两个发布版之间的逐组切换路线（只读） |
 
 状态码约定：`201` 创建/发布成功；`400` 校验失败（起点不早于终点、引用未知
-组、锁定不可用频点等）；`404` 资源不存在；`409` 版本冲突；`422` 约束不可
-满足（当前发布版不变）。
+组、锁定不可用频点、占用频点不属于场次等）；`404` 资源不存在（含撤销未知
+占用记录）；`409` 版本冲突；`422` 约束不可满足（含占用导致；当前发布版
+不变）。
 
 ## 请求示例
 
@@ -129,6 +138,7 @@ curl -s http://localhost:8000/sessions/1/plans/2/diff
     "message": "约束不可满足，当前发布版不变",
     "cause": "locks",
     "locks": [{"group_id": 1, "frequency": 1}],
+    "occupancies": [],
     "interferences": [{"group_a": 1, "group_b": 2, "min_separation": 3}]
   }
 }
@@ -146,6 +156,66 @@ curl -s http://localhost:8000/sessions/1/plans/2/diff
 }
 ```
 
+## 频点占用
+
+现场其他设备会在指定时段占用场次频点。按场次登记或撤销占用记录：
+
+- 登记：`POST /sessions/{id}/occupancies`，输入可用频点与整数分钟时段
+  `[start, end)`，返回记录编号；频点不属于场次、起点不早于终点时返回
+  400 并拒绝整次操作；
+- 查询：`GET /sessions/{id}/occupancies` 列出当前占用（场次详情
+  `GET /sessions/{id}` 中亦包含）；
+- 撤销：`DELETE /sessions/{id}/occupancies/{oid}`，返回被撤销的记录；
+  撤销未知记录（或不属于本场次的记录）返回 404，不改动任何数据。
+
+占用对规划与切换的影响：
+
+- 设备组时段与占用时段相交（左闭右开，端点相接不算）时，该组不得选用
+  被占用频点；
+- 新规划沿用锁定、最少改频、字典序与 `base_version` 规则，并基于一致的
+  当前占用状态：占用变更与发布按场次串行（同一把场次行锁）；
+- 占用导致无解时返回 422，`detail.cause` 为 `"occupancies"` 并列出相关
+  占用记录（以及同样不可缺的锁定与相关干扰关系），当前发布版不变；
+- 已发布版保持不可变，不因占用变化自动重写；逐组换频（`/retune`）按一次
+  一致的当前占用快照检查起终点与每个临时步骤，旧版若因新占用不可行，
+  仍返回 `endpoint_infeasible`，并在 `start` / `target` 的 `occupancies`
+  字段中指出相关占用。
+
+```bash
+# 登记占用：频点 4 在 [0,60) 被其他设备占用
+curl -s -X POST http://localhost:8000/sessions/1/occupancies \
+  -H 'Content-Type: application/json' \
+  -d '{"frequency": 4, "start": 0, "end": 60}'
+# => {"id":1,"session_id":1,"frequency":4,"start":0,"end":60,...}
+
+# 查询当前占用
+curl -s http://localhost:8000/sessions/1/occupancies
+
+# 撤销占用记录 1
+curl -s -X DELETE http://localhost:8000/sessions/1/occupancies/1
+```
+
+占用导致无解的响应示例（422）：
+
+```json
+{
+  "detail": {
+    "error": "unsatisfiable",
+    "message": "约束不可满足，当前发布版不变",
+    "cause": "occupancies",
+    "locks": [],
+    "occupancies": [{"id": 2, "frequency": 1, "start": 30, "end": 90}],
+    "interferences": [{"group_a": 1, "group_b": 2, "min_separation": 3}]
+  }
+}
+```
+
+也可以直接运行示例脚本（需服务已启动）：
+
+```bash
+bash examples/occupancy.sh
+```
+
 ## 逐组切换路线
 
 现场设备无法把新发布版的频点一次切换到位，需要逐组调频。给定**同一场次**
@@ -155,12 +225,14 @@ curl -s http://localhost:8000/sessions/1/plans/2/diff
 - 每一步只把**一个**组改到本场次的可用频点，可借用**临时频点**（某步的新
   频点不是该组在目标版中的频点时，响应中 `temporary` 为 `true`）；
 - 每一步之后（含起点、终点）的**完整分配**都必须满足当前按左闭右开时段
-  生效的干扰关系及最小频点间距；
+  生效的干扰关系及最小频点间距，且不与当前频点占用冲突（组时段与占用
+  时段相交时该频点对本组禁用）；
 - 不可调频组在两版中的频点必须相同，且在整个路线中保持不变；
 - 优化目标依次为：**最少步骤数** → 按各步 `(组编号, 新频点)` 序列取
   **字典序最小**；
-- 该接口为**只读**计算：所有数据在同一个 `REPEATABLE READ` 只读事务（一致
-  配置快照）中读取，不会创建或修改任何发布版。
+- 该接口为**只读**计算：所有数据（含当前占用）在同一个 `REPEATABLE READ`
+  只读事务（一致配置快照）中读取，起终点与每个临时步骤都按这一次一致
+  的占用快照检查，不会创建或修改任何发布版。
 
 请求体：
 
@@ -236,13 +308,14 @@ curl -s -X POST http://localhost:8000/sessions/1/retune \
 | 场次不存在 | 404 | （`"场次不存在"`） |
 | 两版组集合不同，或与场次当前组集合不一致 | 422 | `group_set_mismatch` |
 | 不可调频组在两版中的频点不同（需改频） | 422 | `fixed_group_conflict` |
-| 起始版或目标版在当前规则下不是可行分配（含频点不可用、违反间距） | 422 | `endpoint_infeasible` |
+| 起始版/目标版在当前规则下不是可行分配（含频点不可用、违反间距、与当前占用冲突） | 422 | `endpoint_infeasible` |
 | 两端点均可行，但不存在满足约束的逐组切换路线（配置空间被冻结） | 422 | `no_safe_route` |
 | 搜索规模超过资源上限 | 503 | （`"切换路线搜索超出资源限制…"`） |
 
 `endpoint_infeasible` 会分别给出起点/终点的不可用频点
-（`unavailable`）与违反的干扰关系（`interferences`）；
-`group_set_mismatch` 会给出仅在某一版出现、以及当前配置中缺失/未知的组。
+（`unavailable`）、违反的干扰关系（`interferences`）与冲突的占用记录
+（`occupancies`，含记录编号与受影响组）；`group_set_mismatch` 会给出
+仅在某一版出现、以及当前配置中缺失/未知的组。
 例如端点可行却无安全路线时（422）：
 
 ```json
@@ -263,9 +336,9 @@ bash examples/demo.sh
 ## 项目结构
 
 ```
-app/main.py    HTTP API 与发布事务（行锁串行化并发发布；切换路线只读快照）
-app/solver.py  回溯 + 前向检查求解器；无解时给出不可约的锁定/干扰核心
-app/retune.py  逐组切换路线：连通分量分解 + 限深 BFS（最少步数、字典序最小）
+app/main.py    HTTP API 与发布事务（行锁串行化并发发布与占用变更；切换路线只读快照）
+app/solver.py  回溯 + 前向检查求解器（含占用禁用）；无解时给出不可约的锁定/干扰/占用核心
+app/retune.py  逐组切换路线：连通分量分解 + 限深 BFS（最少步数、字典序最小，含占用禁用）
 app/db.py      连接池、启动重试与 schema 初始化
 schema.sql     表结构（应用启动时幂等执行）
 tests/         求解器单元测试与端到端集成检查
