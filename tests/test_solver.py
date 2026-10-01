@@ -1,6 +1,7 @@
 """求解器单元测试：可脱离数据库直接运行（python -m pytest tests/）。"""
 
-from app.solver import (FrequencySolver, analyze_unsat, intervals_overlap)
+from app.solver import (FrequencySolver, analyze_unsat, build_forbidden,
+                        intervals_overlap)
 
 
 class TestIntervalsOverlap:
@@ -69,6 +70,118 @@ class TestSolve:
         assignment, changes = solver.solve()
         assert assignment == {1: 5}
         assert changes == 0
+
+
+class TestOccupations:
+    def _groups(self):
+        return [{"id": 1, "start": 0, "end": 120},
+                {"id": 2, "start": 60, "end": 180},
+                {"id": 3, "start": 120, "end": 240}]
+
+    def test_build_forbidden_overlap_half_open(self):
+        # 占用 [60,120)：与组1[0,120)、组2[60,180) 相交；端点相接不算
+        forbidden = build_forbidden(
+            self._groups(),
+            [{"id": 1, "frequency": 4, "start": 60, "end": 120}])
+        assert forbidden == {1: {4}, 2: {4}, 3: set()}
+
+    def test_build_forbidden_endpoint_touching_not_overlap(self):
+        # 占用 [120,180)：与组1 在端点 120 相接，不相交；与组2、组3 相交
+        forbidden = build_forbidden(
+            self._groups(),
+            [{"id": 1, "frequency": 7, "start": 120, "end": 180}])
+        assert forbidden == {1: set(), 2: {7}, 3: {7}}
+
+    def test_occupied_frequency_excluded_lex_minimum(self):
+        # 组2 的频点 4 被占用：字典序最小解由 (1,4) 变为 (1,5)
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)], forbidden={2: {4}})
+        assignment, _ = solver.solve()
+        assert (assignment[1], assignment[2]) == (1, 5)
+
+    def test_lock_into_occupied_frequency_unsatisfiable(self):
+        solver = FrequencySolver([1], [1, 2, 3], [], forbidden={1: {1}})
+        assert solver.solve({1: 1}) is None
+
+    def test_all_frequencies_occupied_unsatisfiable(self):
+        solver = FrequencySolver([1], [1, 2], [], forbidden={1: {1, 2}})
+        assert solver.solve() is None
+
+    def test_occupied_frequency_forces_rechange(self):
+        # 前版 (1,4)；频点 4 在组2 时段被占用：组2 必须改频，最小改频下
+        # 组1 保持 1、组2 取 5
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)],
+            previous={1: 1, 2: 4}, forbidden={2: {4}})
+        assignment, changes = solver.solve()
+        assert assignment == {1: 1, 2: 5}
+        assert changes == 1
+
+    def test_occupation_only_blocks_overlapping_group(self):
+        # 占用只与组2 相交：组1 仍可使用该频点
+        solver = FrequencySolver(
+            [1, 2], list(range(1, 7)), [(1, 2, 3)], forbidden={2: {4}})
+        assignment, _ = solver.solve({1: 4})
+        assert assignment == {1: 4, 2: 1}
+
+
+class TestAnalyzeUnsatOccupations:
+    def test_occupation_core(self):
+        # 单组频点 {1,2}，两频点均在其时段被占用：核心含两条占用
+        intervals = {1: (0, 100)}
+        result = analyze_unsat(
+            [1], [1, 2], [], {},
+            occupations=[{"id": 1, "frequency": 1, "start": 0, "end": 100},
+                         {"id": 2, "frequency": 2, "start": 0, "end": 100}],
+            group_intervals=intervals)
+        assert result["cause"] == "occupations"
+        assert {o["id"] for o in result["occupations"]} == {1, 2}
+        # 不可约：任一条占用单独存在时可解
+        for occ in result["occupations"]:
+            solver = FrequencySolver(
+                [1], [1, 2], [],
+                forbidden=build_forbidden(
+                    [{"id": 1, "start": 0, "end": 100}], [occ]))
+            assert solver.solve() is not None
+
+    def test_mixed_interference_occupation_core(self):
+        # 间距 3、频点 1..5：仅干扰关系可解；占用组2 的 4、5 后不可解，
+        # 核心同时包含干扰关系与占用
+        intervals = {1: (0, 100), 2: (0, 100)}
+        occupations = [
+            {"id": 7, "frequency": 4, "start": 0, "end": 100},
+            {"id": 8, "frequency": 5, "start": 0, "end": 100}]
+        result = analyze_unsat(
+            [1, 2], [1, 2, 3, 4, 5], [(1, 2, 3)], {},
+            occupations=occupations, group_intervals=intervals)
+        assert result["cause"] == "occupations"
+        assert {o["id"] for o in result["occupations"]} == {7, 8}
+        assert result["interferences"] == [
+            {"group_a": 1, "group_b": 2, "min_separation": 3}]
+
+    def test_non_overlapping_occupation_irrelevant(self):
+        # 占用时段与所有组都不相交：无解仍归因于干扰关系
+        intervals = {1: (0, 100), 2: (0, 100), 3: (0, 100)}
+        edges = [(1, 2, 2), (1, 3, 2), (2, 3, 2)]
+        result = analyze_unsat(
+            [1, 2, 3], [1, 2, 3], edges, {},
+            occupations=[{"id": 9, "frequency": 1,
+                          "start": 200, "end": 300}],
+            group_intervals=intervals)
+        assert result["cause"] == "interferences"
+        assert result["occupations"] == []
+
+    def test_lock_core_reports_related_occupation(self):
+        # 组1 锁定到被占用的频点 1：核心是锁定，同时列出相关占用
+        intervals = {1: (0, 100), 2: (0, 100)}
+        result = analyze_unsat(
+            [1, 2], [1, 2, 3, 4, 5], [(1, 2, 3)], {1: 1},
+            occupations=[{"id": 5, "frequency": 1,
+                          "start": 0, "end": 100}],
+            group_intervals=intervals)
+        assert result["cause"] == "locks"
+        assert result["locks"] == [{"group_id": 1, "frequency": 1}]
+        assert {o["id"] for o in result["occupations"]} == {5}
 
 
 class TestAnalyzeUnsat:

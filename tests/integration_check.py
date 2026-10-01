@@ -313,6 +313,181 @@ def main() -> int:
         check("端点可行却无安全路线 422", r.status_code == 422
               and r.json()["detail"]["error"] == "no_safe_route", r.text)
 
+        # ---------------------------------------------------------------- #
+        # 频点占用：登记 / 撤销 / 查询、对发布与逐组切换的影响
+        # ---------------------------------------------------------------- #
+        # 占用 422 用小场次：单组 [0,60)、可用频点 {1,2}
+        r = c.post("/sessions", json={"name": "占用演示",
+                                      "frequencies": [1, 2]})
+        oid = r.json()["id"]
+        check("创建占用演示场次", r.status_code == 201, r.text)
+        r = c.post(f"/sessions/{oid}/groups",
+                   json={"name": "组x", "start": 0, "end": 60})
+        gx = r.json()["id"]
+        c.post(f"/sessions/{oid}/plans",
+               json={"base_version": 0, "locks": []})
+
+        # 登记校验：频点不属于场次 / 起点不早于终点 -> 400 整次拒绝
+        r = c.post(f"/sessions/{oid}/occupations",
+                   json={"frequency": 99, "start": 0, "end": 30})
+        check("占用非场次频点被拒绝(400)", r.status_code == 400, r.text)
+        r = c.post(f"/sessions/{oid}/occupations",
+                   json={"frequency": 1, "start": 30, "end": 30})
+        check("占用起点不早于终点被拒绝(400)", r.status_code == 400, r.text)
+        # 场次不存在 -> 404
+        r = c.post("/sessions/999999/occupations",
+                   json={"frequency": 1, "start": 0, "end": 30})
+        check("向不存在场次登记占用(404)", r.status_code == 404, r.text)
+
+        # 正常登记两条占用并查询
+        r = c.post(f"/sessions/{oid}/occupations",
+                   json={"frequency": 1, "start": 0, "end": 60})
+        check("登记占用1", r.status_code == 201, r.text)
+        occ1 = r.json()["id"]
+        r = c.post(f"/sessions/{oid}/occupations",
+                   json={"frequency": 2, "start": 60, "end": 120})
+        check("登记占用2（与组端点相接，不生效）", r.status_code == 201, r.text)
+        occ2 = r.json()["id"]
+        r = c.get(f"/sessions/{oid}/occupations")
+        check("查询当前占用", r.status_code == 200
+              and [o["id"] for o in r.json()] == [occ1, occ2], r.text)
+        r = c.get(f"/sessions/{oid}")
+        check("场次详情含占用列表",
+              len(r.json()["occupations"]) == 2, r.text)
+
+        # 端点相接（[60,120) 与 [0,60)）不算相交：仅频点1不可用，仍可发布
+        r = c.post(f"/sessions/{oid}/plans",
+                   json={"base_version": 1, "locks": []})
+        check("端点相接不影响规划，发布成功", r.status_code == 201
+              and next(a["frequency"] for a in r.json()["assignments"]
+                       if a["group_id"] == gx) == 2, r.text)
+
+        # 撤销未知记录 -> 400；正常撤销后 422 消失
+        r = c.delete(f"/sessions/{oid}/occupations/999999")
+        check("撤销未知占用记录被拒绝(400)", r.status_code == 400, r.text)
+        r = c.delete(f"/sessions/{oid}/occupations/{occ2}")
+        check("撤销占用2", r.status_code == 200
+              and r.json()["revoked"] is True, r.text)
+        r = c.get(f"/sessions/{oid}/occupations")
+        check("撤销后当前占用只剩记录1",
+              [o["id"] for o in r.json()] == [occ1], r.text)
+
+        # 占用使所有频点不可用 -> 422 且指出相关占用，发布版不变
+        r = c.post(f"/sessions/{oid}/occupations",
+                   json={"frequency": 2, "start": 10, "end": 50})
+        check("登记占用3（频点2 覆盖组时段）", r.status_code == 201, r.text)
+        occ3 = r.json()["id"]
+        r = c.post(f"/sessions/{oid}/plans",
+                   json={"base_version": 2, "locks": []})
+        check("占用导致无解(422)", r.status_code == 422, r.text)
+        detail = r.json()["detail"]
+        check("422 指出相关占用",
+              detail["error"] == "unsatisfiable"
+              and detail["cause"] == "occupations"
+              and {o["id"] for o in detail["occupations"]} == {occ1, occ3},
+              str(detail))
+        r = c.get(f"/sessions/{oid}/plans")
+        check("占用无解后发布版不变",
+              [p["version"] for p in r.json()] == [1, 2], r.text)
+
+        # 撤销占用后同一 base_version 可立即发布（已发布版不自动重写）
+        c.delete(f"/sessions/{oid}/occupations/{occ3}")
+        r = c.post(f"/sessions/{oid}/plans",
+                   json={"base_version": 2, "locks": []})
+        check("撤销占用后发布成功", r.status_code == 201, r.text)
+
+        # 占用不回写已发布版：v1 仍是当初的分配（只含组x=1，与现在无关的检查）
+        r = c.get(f"/sessions/{oid}/plans/1")
+        check("已发布版保持不可变",
+              next(a["frequency"] for a in r.json()["assignments"]
+                   if a["group_id"] == gx) == 1, r.text)
+
+        # 占用与发布串行：占用登记期间并发发布只会在占用提交后看到一致状态。
+        # 先恢复一个全占用状态，再串行验证行为即可（锁语义由行锁保证）。
+        r = c.post(f"/sessions/{oid}/occupations",
+                   json={"frequency": 1, "start": 0, "end": 60})
+        check("再次登记占用1", r.status_code == 201, r.text)
+
+        # ---------------------------------------------------------------- #
+        # 占用对逐组切换路线的影响（复用切换演示场次 rid：频点 1..7）
+        # ---------------------------------------------------------------- #
+        # 当前 rid 有 ga gb gd 三组且 v3 为最新；重新构造独立的占用切换场次，
+        # 频点 1..9，三组串行 a[0,120) b[60,180) c[120,240)，边 a-b、b-c 间距3
+        r = c.post("/sessions", json={"name": "占用切换演示",
+                                      "frequencies": list(range(1, 10))})
+        zid = r.json()["id"]
+        zg = []
+        for name, s, e in [("a", 0, 120), ("b", 60, 180), ("c", 120, 240)]:
+            r = c.post(f"/sessions/{zid}/groups",
+                       json={"name": name, "start": s, "end": e})
+            zg.append(r.json()["id"])
+        za, zb, zc = zg
+        c.post(f"/sessions/{zid}/interferences",
+               json={"group_a": za, "group_b": zb, "min_separation": 3})
+        c.post(f"/sessions/{zid}/interferences",
+               json={"group_a": zb, "group_b": zc, "min_separation": 3})
+        c.post(f"/sessions/{zid}/plans",
+               json={"base_version": 0, "locks": [
+                   {"group_id": za, "frequency": 1},
+                   {"group_id": zb, "frequency": 4},
+                   {"group_id": zc, "frequency": 1}]})
+        c.post(f"/sessions/{zid}/plans",
+               json={"base_version": 1, "locks": [
+                   {"group_id": za, "frequency": 4},
+                   {"group_id": zb, "frequency": 1},
+                   {"group_id": zc, "frequency": 4}]})
+
+        # 占用频点 7 的 [60,180)：与 a、b 相交（c 仅端点相接）。
+        # 原字典序最小路线首步 (b,7) 借用临时频点，现须改为 (b,8)。
+        r = c.post(f"/sessions/{zid}/occupations",
+                   json={"frequency": 7, "start": 60, "end": 180})
+        check("登记切换占用(频点7)", r.status_code == 201, r.text)
+        zocc = r.json()["id"]
+        r = c.post(f"/sessions/{zid}/retune",
+                   json={"start_version": 1, "target_version": 2})
+        check("占用下切换路线 200", r.status_code == 200, r.text)
+        steps = [(s["group_id"], s["frequency"])
+                 for s in r.json()["steps"]]
+        check("占用改变字典序路线：首步改用频点8",
+              steps == [(zb, 8), (za, 4), (zc, 4), (zb, 1)], str(steps))
+
+        # 撤销占用后恢复原路线（b 借用 7）
+        c.delete(f"/sessions/{zid}/occupations/{zocc}")
+        r = c.post(f"/sessions/{zid}/retune",
+                   json={"start_version": 1, "target_version": 2})
+        steps = [(s["group_id"], s["frequency"])
+                 for s in r.json()["steps"]]
+        check("撤销占用后恢复原路线",
+              steps == [(zb, 7), (za, 4), (zc, 4), (zb, 1)], str(steps))
+
+        # 占用使旧版端点不可行：占用频点 1 的 [60,180) 与 a、b 相交，
+        # c 仅端点相接。以 v2 为起点（a=4,b=1,c=4，b 撞占用）、v1 为终点
+        # （a=1,b=4,c=1，a 撞占用）-> 两端均不可行，422 endpoint_infeasible
+        # 并指出相关占用。
+        r = c.post(f"/sessions/{zid}/occupations",
+                   json={"frequency": 1, "start": 60, "end": 180})
+        check("登记占用频点1", r.status_code == 201, r.text)
+        zocc2 = r.json()["id"]
+        r = c.post(f"/sessions/{zid}/retune",
+                   json={"start_version": 2, "target_version": 1})
+        check("旧版因新占用端点不可行(422)", r.status_code == 422
+              and r.json()["detail"]["error"] == "endpoint_infeasible", r.text)
+        detail = r.json()["detail"]
+        rel_ids = {o["id"] for o in detail["start"]["related_occupations"]} \
+            | {o["id"] for o in detail["target"]["related_occupations"]}
+        check("endpoint_infeasible 指出相关占用", rel_ids == {zocc2},
+              str(detail))
+        check("占用冲突定位到具体组与频点",
+              detail["start"]["occupations"] == [
+                  {"group_id": zb, "frequency": 1}]
+              and detail["target"]["occupations"] == [
+                  {"group_id": za, "frequency": 1},
+                  {"group_id": zc, "frequency": 1}], str(detail))
+        # retune 只读：占用与发布版均无新增变化
+        r = c.get(f"/sessions/{zid}/plans")
+        check("占用下路线查询不改动发布版",
+              [p["version"] for p in r.json()] == [1, 2], r.text)
+
         print()
         if _failures:
             print(f"{len(_failures)} 项失败: {_failures}")

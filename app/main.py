@@ -7,10 +7,10 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException
 
 from . import db
-from .schemas import (GroupCreate, InterferenceCreate, PlanCreate,
-                      RetuneRequest, SessionCreate)
+from .schemas import (GroupCreate, InterferenceCreate, OccupationCreate,
+                      PlanCreate, RetuneRequest, SessionCreate)
 from .solver import (FrequencySolver, SolverLimitExceeded, analyze_unsat,
-                     intervals_overlap)
+                     build_forbidden, intervals_overlap)
 from .retune import RetunePlanner, RetuneLimitExceeded
 
 
@@ -24,9 +24,10 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="频点协调服务",
-    version="1.0.0",
+    version="1.1.0",
     description="为临时演出的无线电设备组协调频点：录入场次、设备组时段与"
-                "干扰关系，按约束规划并发布不可变的频点分配版本。",
+                "干扰关系，登记/撤销外部设备频点占用，按约束规划并发布不可"
+                "变的频点分配版本。",
     lifespan=lifespan,
 )
 
@@ -84,12 +85,34 @@ def _load_interferences(conn, session_id: int):
                  "min_separation": r[3]} for r in cur.fetchall()]
 
 
+def _load_occupations(conn, session_id: int):
+    """读取场次当前全部占用记录（撤销即删除，故此处即“当前占用”）。
+
+    调用方在需要串行化时应先持有场次行锁（见发布与占用登记/撤销）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, frequency, start_min, end_min, created_at "
+            "FROM occupations WHERE session_id = %s ORDER BY id",
+            (session_id,))
+        return [{"id": r[0], "frequency": r[1], "start": r[2], "end": r[3],
+                 "created_at": r[4]} for r in cur.fetchall()]
+
+
+def _occ_public(occ: dict) -> dict:
+    """占用记录的对外结构（不含 created_at 等内部字段时同样适用）。"""
+    return {"id": occ["id"], "frequency": occ["frequency"],
+            "start": occ["start"], "end": occ["end"]}
+
+
 @app.get("/sessions/{session_id}")
 def get_session(session_id: int, conn=Depends(db.get_conn)):
-    """读取场次详情（含设备组与干扰关系）。"""
+    """读取场次详情（含设备组、干扰关系与当前占用记录）。"""
     session = _load_session(conn, session_id)
     session["groups"] = _load_groups(conn, session_id)
     session["interferences"] = _load_interferences(conn, session_id)
+    session["occupations"] = [
+        {k: occ[k] for k in ("id", "frequency", "start", "end")}
+        for occ in _load_occupations(conn, session_id)]
     return session
 
 
@@ -142,6 +165,68 @@ def create_interference(session_id: int, payload: InterferenceCreate,
 
 
 # --------------------------------------------------------------------- #
+# 频点占用（现场其他设备在指定时段占用场次频点）
+# --------------------------------------------------------------------- #
+@app.post("/sessions/{session_id}/occupations", status_code=201)
+def create_occupation(session_id: int, payload: OccupationCreate,
+                      conn=Depends(db.get_conn)):
+    """登记一条频点占用记录，返回记录编号。
+
+    占用频点须属于场次可用集合，时段为整数分钟左闭右开 [start, end)；
+    频点不属于场次或起点不早于终点时拒绝整次操作（400）。占用登记/撤销
+    与发布按场次串行（同锁场次行），已发布版保持不可变，不会因占用变化
+    自动重写。
+    """
+    # 锁场次行：与发布及其他占用变更互斥，保证发布基于一致占用状态
+    session = _load_session(conn, session_id, for_update=True)
+    if payload.start >= payload.end:
+        raise bad_request("占用时段起点必须早于终点（左闭右开）")
+    if payload.frequency not in session["frequencies"]:
+        raise bad_request(
+            f"被占用频点 {payload.frequency} 不在场次可用频点集合中")
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO occupations (session_id, frequency, start_min, end_min)"
+            " VALUES (%s, %s, %s, %s) RETURNING id, created_at",
+            (session_id, payload.frequency, payload.start, payload.end))
+        occupation_id, created_at = cur.fetchone()
+    conn.commit()
+    return {"id": occupation_id, "session_id": session_id,
+            "frequency": payload.frequency, "start": payload.start,
+            "end": payload.end, "created_at": created_at}
+
+
+@app.delete("/sessions/{session_id}/occupations/{occupation_id}")
+def delete_occupation(session_id: int, occupation_id: int,
+                      conn=Depends(db.get_conn)):
+    """撤销（删除）一条占用记录；记录未知或不属于本场次时拒绝（400）。"""
+    # 锁场次行：与发布及其他占用变更互斥
+    _load_session(conn, session_id, for_update=True)
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM occupations WHERE id = %s AND session_id = %s "
+            "RETURNING frequency, start_min, end_min",
+            (occupation_id, session_id))
+        row = cur.fetchone()
+    if row is None:
+        raise bad_request(f"撤销的占用记录 {occupation_id} 不存在")
+    conn.commit()
+    return {"id": occupation_id, "session_id": session_id,
+            "revoked": True, "frequency": row[0],
+            "start": row[1], "end": row[2]}
+
+
+@app.get("/sessions/{session_id}/occupations")
+def list_occupations(session_id: int, conn=Depends(db.get_conn)):
+    """查询场次当前占用（已撤销的记录不再出现），按记录编号升序。"""
+    _load_session(conn, session_id)
+    occupations = _load_occupations(conn, session_id)
+    return [{"id": occ["id"], "frequency": occ["frequency"],
+             "start": occ["start"], "end": occ["end"],
+             "created_at": occ["created_at"]} for occ in occupations]
+
+
+# --------------------------------------------------------------------- #
 # 规划与发布
 # --------------------------------------------------------------------- #
 def _current_version(conn, session_id: int) -> int:
@@ -164,8 +249,9 @@ def publish_plan(session_id: int, payload: PlanCreate,
     """规划并发布新版本。
 
     须提交所见版本号 base_version：与当前最新发布版不一致时返回 409，
-    并发发布只有一个可以成功。无解时返回 422 并说明涉及的锁定组或
-    干扰关系，当前发布版不变。
+    并发发布只有一个可以成功。规划在同一场次行锁内读取当前占用，保证
+    基于一致占用状态；占用与干扰、锁定共同导致无解时返回 422 并说明
+    涉及的锁定组、干扰关系或相关占用记录，当前发布版不变。
     """
     # 锁定场次行，串行化并发发布
     session = _load_session(conn, session_id, for_update=True)
@@ -180,7 +266,13 @@ def publish_plan(session_id: int, payload: PlanCreate,
     groups = _load_groups(conn, session_id)
     group_by_id = {g["id"]: g for g in groups}
     interferences = _load_interferences(conn, session_id)
+    # 发布在同一场次行锁内读取当前占用，保证基于一致占用状态
+    occupations = _load_occupations(conn, session_id)
     available = set(session["frequencies"])
+
+    # 设备组时段与占用时段相交（左闭右开）时禁用该频点
+    forbidden = build_forbidden(groups, occupations)
+    group_intervals = {g["id"]: (g["start"], g["end"]) for g in groups}
 
     # 校验锁定：引用未知组 / 锁定不可用频点 / 重复锁定均拒绝整次操作
     locks: dict[int, int] = {}
@@ -215,15 +307,16 @@ def publish_plan(session_id: int, payload: PlanCreate,
     try:
         result = FrequencySolver(
             [g["id"] for g in groups], session["frequencies"], edges,
-            previous).solve(locks)
+            previous, forbidden=forbidden).solve(locks)
     except SolverLimitExceeded:
         raise HTTPException(status_code=503,
                             detail="求解超出资源限制，请缩小规模后重试")
 
     if result is None:
-        analysis = analyze_unsat([g["id"] for g in groups],
-                                 session["frequencies"], edges, locks,
-                                 previous)
+        analysis = analyze_unsat(
+            [g["id"] for g in groups], session["frequencies"], edges, locks,
+            previous, occupations=[_occ_public(o) for o in occupations],
+            group_intervals=group_intervals)
         raise HTTPException(
             status_code=422,
             detail={"error": "unsatisfiable",
@@ -371,17 +464,37 @@ def _assignment_list(assignment: dict[int, int]):
             for gid in sorted(assignment)]
 
 
+def _endpoint_occ_detail(bad: dict, group_by_id: dict, occupations: list[dict]):
+    """在端点违规（unavailable/interferences/occupations）基础上补全相关
+    占用记录：按组时段与占用时段相交且频点相同匹配。"""
+    related = []
+    seen = set()
+    for item in bad["occupations"]:
+        g = group_by_id[item["group_id"]]
+        for occ in occupations:
+            if occ["id"] in seen:
+                continue
+            if occ["frequency"] != item["frequency"]:
+                continue
+            if intervals_overlap(g["start"], g["end"],
+                                 occ["start"], occ["end"]):
+                seen.add(occ["id"])
+                related.append(_occ_public(occ))
+    return {**bad, "related_occupations": related}
+
+
 @app.post("/sessions/{session_id}/retune")
 def plan_retune(session_id: int, payload: RetuneRequest,
                 conn=Depends(db.get_conn)):
     """计算从起始发布版到目标发布版的逐组调频切换路线（只读，不改发布版）。
 
     每步只把一个组改到本场次可用频点（可借用临时频点），每步之后的完整
-    分配都须满足按时段相交生效的干扰关系及最小间距；不可调频组全程保持
-    不变。先最小化步骤数，再按 (组编号, 新频点) 序列取字典序最小。
+    分配都须满足按时段相交生效的干扰关系及最小间距；外部设备占用的频点
+    在起点、终点与每个临时步骤都不可选用；不可调频组全程保持不变。先
+    最小化步骤数，再按 (组编号, 新频点) 序列取字典序最小。
 
-    本接口为只读计算：所有数据在同一个可串行化快照事务中读取，保证配置
-    快照一致，且不会创建或修改任何发布版。
+    本接口为只读计算：配置、发布版与当前占用在同一个可串行化快照事务中
+    读取，保证快照一致，且不会创建或修改任何发布版或占用记录。
     """
     # 显式开启只读的可重复读事务，使全部读取基于同一份配置快照
     with conn.cursor() as cur:
@@ -392,6 +505,8 @@ def plan_retune(session_id: int, payload: RetuneRequest,
         groups = _load_groups(conn, session_id)
         group_ids = {g["id"] for g in groups}
         interferences = _load_interferences(conn, session_id)
+        # 与配置、发布版在同一个可重复读只读事务中读取，占用快照一致
+        occupations = _load_occupations(conn, session_id)
 
         start = _assignments_for_version(
             conn, session_id, payload.start_version)
@@ -462,16 +577,25 @@ def plan_retune(session_id: int, payload: RetuneRequest,
                 edges.append((itf["group_a"], itf["group_b"],
                               itf["min_separation"]))
 
+        # 当前占用快照：设备组时段与占用时段相交时禁用相应频点；
+        # 起终点及每个临时步骤都按这一份快照检查
+        forbidden = build_forbidden(groups, occupations)
+
         planner = RetunePlanner(
             sorted(group_ids), session["frequencies"], edges,
-            start, target, fixed)
+            start, target, fixed, forbidden=forbidden)
         start_bad, target_bad = planner.endpoint_violations()
         if start_bad["unavailable"] or start_bad["interferences"] \
-                or target_bad["unavailable"] or target_bad["interferences"]:
+                or start_bad["occupations"] \
+                or target_bad["unavailable"] or target_bad["interferences"] \
+                or target_bad["occupations"]:
             raise _retune_error(
                 422, "endpoint_infeasible",
-                "起始版或目标版在当前规则下不是可行分配",
-                start=start_bad, target=target_bad)
+                "起始版或目标版在当前规则（含频点占用）下不是可行分配",
+                start=_endpoint_occ_detail(start_bad, group_by_id,
+                                           occupations),
+                target=_endpoint_occ_detail(target_bad, group_by_id,
+                                            occupations))
 
         try:
             route = planner.plan()

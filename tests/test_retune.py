@@ -81,7 +81,8 @@ def lex_min_bruteforce(planner, start, target):
 class TestViolations:
     def test_clean_assignment(self):
         v = violations([1, 2], {1: 1, 2: 4}, [(1, 2, 3)], [1, 2, 3, 4, 5])
-        assert v == {"unavailable": [], "interferences": []}
+        assert v == {"unavailable": [], "interferences": [],
+                     "occupations": []}
 
     def test_unavailable_frequency(self):
         v = violations([1, 2], {1: 1, 2: 9}, [(1, 2, 3)], [1, 2, 3])
@@ -94,6 +95,13 @@ class TestViolations:
         assert v["unavailable"] == []
         assert v["interferences"] == [
             {"group_a": 1, "group_b": 2, "min_separation": 3}]
+
+    def test_occupation_violation(self):
+        v = violations([1, 2], {1: 1, 2: 4}, [(1, 2, 3)],
+                       [1, 2, 3, 4, 5], forbidden={2: {4}})
+        assert v["unavailable"] == []
+        assert v["interferences"] == []
+        assert v["occupations"] == [{"group_id": 2, "frequency": 4}]
 
 
 class TestRetuneBasic:
@@ -145,6 +153,68 @@ class TestRetuneBasic:
         assert_route_valid(route, start, target, edges)
         assert len(route) == 4
         assert route == [(2, 7), (1, 4), (3, 4), (2, 1)]
+
+
+class TestOccupations:
+    """外部设备占用：端点与每个临时步骤都不得选用被占用频点。"""
+
+    edges = [(1, 2, 3), (2, 3, 3)]
+    start = {1: 1, 2: 4, 3: 1}
+    target = {1: 4, 2: 1, 3: 4}
+
+    def assert_route_respects_forbidden(self, route, forbidden):
+        state = dict(self.start)
+        for gid, freq in route:
+            state[gid] = freq
+            assert freq not in forbidden.get(gid, set())
+            for a, b, sep in self.edges:
+                assert abs(state[a] - state[b]) >= sep
+        assert state == self.target
+
+    def test_occupied_temp_frequency_reroutes(self):
+        # 频点 1..9；占用 7 覆盖组1、组2 时段（组3 仅端点相接不受影响），
+        # 原本字典序最小路线首步借用 7，现须改用 8
+        planner = RetunePlanner(
+            [1, 2, 3], list(range(1, 10)), self.edges,
+            self.start, self.target, forbidden={1: {7}, 2: {7}})
+        route = planner.plan()
+        assert route != NO_SAFE_ROUTE
+        assert route == [(2, 8), (1, 4), (3, 4), (2, 1)]
+        self.assert_route_respects_forbidden(
+            route, {1: {7}, 2: {7}})
+
+    def test_endpoint_uses_occupied_frequency(self):
+        # 组2 的目标频点 1 在其时段被占用：终点不可行
+        planner = RetunePlanner(
+            [1, 2, 3], list(range(1, 10)), self.edges,
+            self.start, self.target, forbidden={2: {1}})
+        start_bad, target_bad = planner.endpoint_violations()
+        assert start_bad["occupations"] == []
+        assert target_bad["occupations"] == [
+            {"group_id": 2, "frequency": 1}]
+
+    def test_occupation_blocks_only_buffer_frozen(self):
+        # 两组交换 (1,4)<->(4,1)、频点 1..7、间距 3；唯一缓冲频点 7 对两组
+        # 均被占用时无安全路线
+        planner = RetunePlanner(
+            [1, 2], list(range(1, 8)), [(1, 2, 3)],
+            {1: 1, 2: 4}, {1: 4, 2: 1}, forbidden={1: {7}, 2: {7}})
+        assert planner.plan() == NO_SAFE_ROUTE
+
+    def test_endpoint_touching_occupation_not_forbidden(self):
+        # 占用仅与组3 在端点 120 相接（左闭右开不相交）：不影响路线
+        planner = RetunePlanner(
+            [1, 2, 3], list(range(1, 10)), self.edges,
+            self.start, self.target, forbidden={3: {4}})
+        # 组3 目标频点正是 4，但占用 [120,180) 与其 [120,240) 相交才禁用；
+        # 这里构造的 forbidden 已假定相交，改测端点相接的情形：禁用集为空
+        planner2 = RetunePlanner(
+            [1, 2, 3], list(range(1, 10)), self.edges,
+            self.start, self.target, forbidden={})
+        assert planner2.plan() == [(2, 7), (1, 4), (3, 4), (2, 1)]
+        # planner 自身（禁用 4）终点不可行
+        _, target_bad = planner.endpoint_violations()
+        assert target_bad["occupations"] == [{"group_id": 3, "frequency": 4}]
 
 
 class TestFixedGroups:

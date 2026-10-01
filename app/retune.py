@@ -4,7 +4,8 @@
 切换。本模块在两个均已可行的端点分配之间，寻找满足以下条件的操作序列：
 
 1. 每一步只把一个组改到本场次的可用频点（可借用临时频点），不可调频组
-   全程不动；
+   全程不动；设备组时段与外部设备占用时段相交（左闭右开）时，被占用频点
+   在起点、终点及每一个临时步骤中都不可选用（占用取一次一致快照）；
 2. 每一步之后（含起点与终点）的完整分配都满足当前按时段相交生效的干扰
    关系及最小频点间距；
 3. 先最小化步骤数，再按各步的 (组编号, 新频点) 序列取字典序最小。
@@ -28,22 +29,29 @@ class RetuneLimitExceeded(Exception):
     """搜索状态数超过资源上限。"""
 
 
-def violations(groups, assignment, edges, frequencies):
-    """返回端点分配的不可行之处：不可用频点与违反的干扰关系。
+def violations(groups, assignment, edges, frequencies, forbidden=None):
+    """返回端点分配的不可行之处：不可用频点、违反的干扰关系与占用冲突。
 
     :param groups:      全部组编号。
     :param assignment:  {group_id: frequency}。
     :param edges:       调用方已按“时段相交”过滤的生效干扰关系。
     :param frequencies: 场次可用频点集合。
+    :param forbidden:   {group_id: set(frequencies)}，外部设备占用导致该组
+                        时段内禁用的频点（一次一致的当前占用快照）。
     """
     available = set(frequencies)
+    forbidden = forbidden or {}
     unavailable = [
         {"group_id": g, "frequency": assignment[g]}
         for g in sorted(groups) if assignment[g] not in available]
     bad_edges = [
         {"group_a": a, "group_b": b, "min_separation": sep}
         for a, b, sep in edges if abs(assignment[a] - assignment[b]) < sep]
-    return {"unavailable": unavailable, "interferences": bad_edges}
+    bad_occupations = [
+        {"group_id": g, "frequency": assignment[g]}
+        for g in sorted(groups) if assignment[g] in forbidden.get(g, ())]
+    return {"unavailable": unavailable, "interferences": bad_edges,
+            "occupations": bad_occupations}
 
 
 class RetunePlanner:
@@ -56,15 +64,21 @@ class RetunePlanner:
     :param start:       起始版分配 {group_id: frequency}。
     :param target:      目标版分配 {group_id: frequency}。
     :param fixed:       切换期间不可调频的组集合。
+    :param forbidden:   {group_id: set(frequencies)}，外部设备占用导致该组
+                        时段内禁用的频点；起点、终点与每个临时步骤都受其约束。
     """
 
     def __init__(self, group_ids, frequencies, edges, start, target,
-                 fixed=(), max_states: int = 200_000):
+                 fixed=(), forbidden=None, max_states: int = 200_000):
         self.groups = sorted(set(group_ids))
         self.frequencies = sorted(set(frequencies))
         self.start = dict(start)
         self.target = dict(target)
         self.fixed = set(fixed)
+        self.forbidden = {g: set() for g in self.groups}
+        for gid, freqs in (forbidden or {}).items():
+            if gid in self.forbidden:
+                self.forbidden[gid] = set(freqs)
         self.edges = [(a, b, s) for a, b, s in edges]
         self.adj = {g: [] for g in self.groups}
         for g1, g2, sep in self.edges:
@@ -77,9 +91,9 @@ class RetunePlanner:
     def endpoint_violations(self):
         """检查两个端点是否可行；返回 (起点问题, 终点问题)，均为空才可行。"""
         return (violations(self.groups, self.start, self.edges,
-                           self.frequencies),
+                           self.frequencies, self.forbidden),
                 violations(self.groups, self.target, self.edges,
-                           self.frequencies))
+                           self.frequencies, self.forbidden))
 
     # ------------------------------------------------------------------ #
     # 贪心构造路线长度上界（可达时供 BFS 限深；不可达时不可信）
@@ -113,7 +127,9 @@ class RetunePlanner:
                             continue
                         bpos = lidx[b]
                         vals = [f for f in self.frequencies
-                                if f != state[bpos] and all(
+                                if f != state[bpos]
+                                and f not in self.forbidden[b]
+                                and all(
                                     abs(state[lidx[o]] - f) >= sep2
                                     for o, sep2 in self.adj[b])]
                         if vals:
@@ -199,7 +215,7 @@ class RetunePlanner:
                 base = state[:pos]
                 tail = state[pos + 1:]
                 for value in freqs:  # 频点升序；跳过当前频点（空操作不优）
-                    if value == cur:
+                    if value == cur or value in self.forbidden[g]:
                         continue
                     for o, sep in self.adj[g]:
                         if abs(state[lidx[o]] - value) < sep:

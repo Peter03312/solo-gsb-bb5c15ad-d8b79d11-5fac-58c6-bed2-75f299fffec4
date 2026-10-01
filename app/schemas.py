@@ -42,3 +42,10 @@ class RetuneRequest(BaseModel):
     fixed_groups: list[int] = Field(
         default_factory=list,
         description="切换期间不可调频的组编号；其在两版中的频点必须相同")
+
+
+class OccupationCreate(BaseModel):
+    frequency: int = Field(
+        description="被其他设备占用的可用频点（须属于场次可用集合）")
+    start: int = Field(description="占用时段起点（分钟，左闭）")
+    end: int = Field(description="占用时段终点（分钟，右开）")

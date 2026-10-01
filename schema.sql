@@ -51,3 +51,18 @@ CREATE TABLE IF NOT EXISTS plan_locks (
     frequency    INTEGER NOT NULL,
     PRIMARY KEY (plan_id, group_id)
 );
+
+-- 外部设备占用记录：场次频点在指定整数分钟时段 [start, end) 被其他设备占用。
+-- 设备组时段与占用时段相交（左闭右开，端点相接不算相交）时不得选用该频点。
+CREATE TABLE IF NOT EXISTS occupations (
+    id           SERIAL PRIMARY KEY,
+    session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    frequency    INTEGER NOT NULL,            -- 被占用的频点（须属于场次可用集合）
+    start_min    INTEGER NOT NULL,            -- 占用起点（分钟，左闭）
+    end_min      INTEGER NOT NULL,            -- 占用终点（分钟，右开）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (start_min < end_min)
+);
+
+CREATE INDEX IF NOT EXISTS idx_occupations_session
+    ON occupations (session_id);
